@@ -34,6 +34,7 @@ sub new {
         interactive => undef,
         log => undef,
         mirrors => [],
+        mirror_only => 0,
         perl => $^X,
         argv => [],
         local_lib => undef,
@@ -77,6 +78,7 @@ sub parse_options {
         'l|local-lib=s' => sub { $self->{local_lib} = $self->maybe_abs($_[1]) },
         'L|local-lib-contained=s' => sub { $self->{local_lib} = $self->maybe_abs($_[1]); $self->{self_contained} = 1 },
         'mirror=s@' => $self->{mirrors},
+        'mirror-only!' => \$self->{mirror_only},
         'prompt!'   => \$self->{prompt},
         'installdeps' => \$self->{installdeps},
         'skip-installed!' => \$self->{skip_installed},
@@ -167,6 +169,10 @@ sub fetch_meta {
 sub search_module {
     my($self, $module) = @_;
 
+    if ($self->{mirror_only}) {
+        return $self->search_module_list($module);
+    }
+
     $self->chat("Searching $module on cpanmetadb ...\n");
     my $uri  = "http://cpanmetadb.appspot.com/v1.0/package/$module";
     my $yaml = $self->get($uri);
@@ -184,6 +190,70 @@ sub search_module {
         and return $self->cpan_module($module, $1);
 
     $self->diag_fail("Finding $module on search.cpan.org failed.");
+
+    return;
+}
+
+sub search_module_list {
+    my($self, $module) = @_;
+
+    my $modlist = "$self->{home}/02packages.details.txt.gz";
+
+    # Do we have a local copy? Prefer it if so
+    if (my $file_cpan = (grep /^file:/, @{$self->{mirrors}})[0]) {
+        $file_cpan =~ s{^file:/+}{/};
+        $modlist = "$file_cpan/modules/02packages.details.txt.gz";
+
+    # XXX: Only download once a day -- lame -- but without support for
+    # If-Modified-Since or something in the downloaders I don't want to be
+    # responsible for caning mirrors.
+    } elsif (!-f $modlist || -M $modlist) {
+        for my $uri (map "$_/modules/02packages.details.txt.gz", @{$self->{mirrors}}) {
+            last if $self->mirror($uri, $modlist);
+        }
+    }
+
+    my $decomp = eval { require Compress::Zlib; "Compress::Zlib" }
+              or eval { require Compress::Zlib::Perl; "Compress::Zlib::Perl" };
+
+    if ($decomp) {
+      open my $mod_fh, "<$modlist" or die "Opening $modlist failed: $!";
+      binmode $mod_fh;
+
+      # Only support the most basic gzip files, but this saves a dep. on
+      # IO::Uncompress::Gunzip. (Code partly butchered from there though.)
+      my $in;
+      read $mod_fh, $in, 10;
+      my $flag = (unpack("C4", $in))[3];
+
+      if ($flag & 0x4) { # extra
+          read $mod_fh, $in, 2;
+      }
+
+      if ($flag & 0x8) { # name
+          1 while read $mod_fh, $in, 1 && $in ne "\0";
+      }
+
+      my $inflate = do { no strict 'refs'; \&{$decomp . "::inflateInit"} }->(
+          -WindowBits => -$decomp->MAX_WBITS);
+
+      while (read $mod_fh, $in, 8192) {
+          my($out, $status) = $inflate->inflate($in);
+          return if $status == $decomp->Z_STREAM_END;
+
+          if ($out =~ /^\Q$module\E\s+(\S+)\s+(.*)$/m) {
+              return $self->cpan_module($module, $2, $1);
+          }
+      }
+    } else {
+      open my $gzip_fh, "gunzip -c $modlist |" or die "Unable to gunzip $modlist: $!";
+
+      while (<$gzip_fh>) {
+          if (/^\Q$module\E\s+(\S+)\s+(.*)$/m) {
+              return $self->cpan_module($module, $2, $1);
+          }
+      }
+    }
 
     return;
 }
@@ -648,7 +718,7 @@ sub install_module {
         return 1;
     }
 
-    if ($dist->{source} eq 'cpan') {
+    if ($dist->{source} eq 'cpan' && !$self->{mirror_only}) {
         $dist->{meta} = $self->fetch_meta($dist);
     }
 
